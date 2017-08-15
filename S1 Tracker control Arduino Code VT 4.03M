@@ -1,0 +1,953 @@
+// You are using the S1 Solar tracker controller made by Geng Qin, SES
+//
+
+// Here are some explenations of the GPS information
+// $GPGGA (Fix information)
+// $GPGSA (Overall Satellite data)
+// $GPRMC (Global Positioning Recommended Minimum Coordinates)
+// $GPTVG (Vector track an Speed over the Ground)
+
+// $GPRMC
+// Current GMT (hhmmss.ms)
+// Statuc code V(invalid) A(active)
+// Next 4 space is location. N and E are positive, S and W are negative.
+// It is in degrees and minutes in the following format:
+// Latitude: DDMM.MMMM (The first two characters are the degrees.)
+// Longitude: DDDMM.MMMM (The first three characters are the degrees.)
+// Speed in knots.
+// Current date (ddmmyy)
+
+// Test code for Adafruit GPS modules using MTK3329/MTK3339 driver
+//
+// This code shows how to listen to the GPS module in an interrupt
+// which allows the program to have more 'freedom' - just parse
+// when a new NMEA sentence is available! Then access data when
+// desired.
+
+// Free pin after GPS Digital 2,3,4,5,6
+
+
+#include <Adafruit_GPS.h>
+#include <SoftwareSerial.h>
+
+// If you're using a GPS module:
+// Connect the GPS Power pin to 5V
+// Connect the GPS Ground pin to ground
+// If using software serial (sketch example default):
+//   Connect the GPS TX (transmit) pin to Digital 3
+//   Connect the GPS RX (receive) pin to Digital 2
+// If using hardware serial (e.g. Arduino Mega):
+//   Connect the GPS TX (transmit) pin to Arduino RX1, RX2 or RX3
+//   Connect the GPS RX (receive) pin to matching TX1, TX2 or TX3
+
+// If you're using the Adafruit GPS shield, change
+// SoftwareSerial mySerial(3, 2); -> SoftwareSerial mySerial(8, 7);
+// and make sure the switch is set to SoftSerial
+
+// If using software serial, keep this line enabled
+// (you can change the pin numbers to match your wiring):
+//SoftwareSerial mySerial(8, 7);
+
+// If using hardware serial (e.g. Arduino Mega), comment out the
+// above SoftwareSerial line, and enable this line instead
+// (you can change the Serial number to match your wiring):
+
+HardwareSerial mySerial = Serial1;
+
+Adafruit_GPS GPS(&Serial1);
+
+
+// Set GPSECHO to 'false' to turn off echoing the GPS data to the Serial console
+// Set to 'true' if you want to debug and listen to the raw GPS sentences.
+#define GPSECHO  false
+
+// this keeps track of whether we're using the interrupt
+// off by default!
+boolean usingInterrupt = false;
+void useInterrupt(boolean); // Func prototype keeps Arduino 0023 happy
+
+boolean GPSdebug = false;                     //Switch for GPS debugging. True if you want to look at calculation steps
+
+boolean Stow;                          //Switch for Stow mode
+boolean Windalarm;                     //Switch for Wind speed alarm
+int Morningtimer;
+
+//------------------------------------------------------------------------------------------------
+// Define all values
+
+int iday = 0;                                 //Counting seconds in a day to reset GPS data
+
+const int speedlimit = 30;                   //Mph speed limit for stow
+
+int Localsecond, Localminute, Localhour, Localday, Localmonth, Localyear, timezone;            //Defining data for local date display.
+const double rad = 57.2957795;                      //For radian and degree translation
+double setlatitude, setlongitude, secint, hourint, timeint; //Defining values for sun GPS lovation
+double juliancentury;
+double geomeanlongdou, geomeanlong, geomeananom, earthorbit, suneq;
+double suntruelong, suntrueanom, sunradvector, sunapplong, meanobliq, obliqcorr;
+double asceny, ascenx, ascentan, sunrtascen, sundeclin, vary, eqtime;
+double hasunrise, solarnoon, sunrisetime, sunsettime, sunduration, truesolardou;
+double truesolar, hourangle, solarzenith, solarelevation;
+double pangledou, solarazimuth;
+int geomeanlongint, truesolarint, pangleint;                //end Defining values for sun GPS location
+double lastelevation, lastazimuth, NSmotor, EWmotor;        //calculation for
+
+int timediff;
+uint32_t internaltime;
+
+int northlimit = 92;
+int southlimit = 30;
+int eastlimit = 90;
+int westlimit = 280;
+
+int trackmodify = 2050;   //normal 1666
+
+//Timers
+double Stowtimer, Resettimer, Windtimer, windalarmtimer, windalarmcountdown, loggertimer;
+
+// Setup Pin mode
+const int StowbuttonPin = 2;     // the number of the pushbutton pin
+int Stowbutton;         // variable for reading the pushbutton status
+
+long held;    // How long the button was held (milliseconds)
+unsigned long firsttime; // how long since the button was first pressed
+
+const int AnemometerPin = 3;   //Anemometer pin
+double anemometerread, windspeed, windspeedavg, windspeedsum;
+int windspeednum;
+
+const int NorthPin = 6;
+const int SouthPin = 5;
+const int EastPin = 4;
+const int WestPin = 3;
+
+#include <SPI.h>
+#include <SD.h>
+
+// On the Ethernet Shield, CS is pin 4. Note that even if it's not
+// used as the CS pin, the hardware CS pin (10 on most Arduino boards,
+// 53 on the Mega) must be left as an output or the SD library
+// functions will not work.
+const int chipSelect = 9;
+
+File dataFile;
+
+void setup() {
+
+  // connect at 115200 so we can read the GPS fast enough and echo without dropping chars
+  // also spit it out
+  Serial.begin(115200);
+  Serial.println("S1 GPS Solar Tracker VT4.00.M");
+  Dashline();
+
+  // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
+  GPS.begin(9600);
+
+  // initialize the pushbutton pin as an input:
+  pinMode(StowbuttonPin, INPUT);
+  pinMode(AnemometerPin, INPUT);
+  pinMode(NorthPin, OUTPUT);
+  pinMode(SouthPin, OUTPUT);
+  pinMode(EastPin, OUTPUT);
+  pinMode(WestPin, OUTPUT);
+
+  digitalWrite (NorthPin, HIGH);
+  digitalWrite (SouthPin, HIGH);
+  digitalWrite (EastPin, HIGH);
+  digitalWrite (WestPin, HIGH);
+
+  Stow = false;                          //Switch for Stow mode
+  Windalarm = false;                     //Switch for Wind speed alarm
+  Morningtimer = 1;
+
+  Serial.println("\nInitiallizing GPS functions...");
+
+  // uncomment this line to turn on RMC (recommended minimum) and GGA (fix data) including altitude
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  // uncomment this line to turn on only the "minimum recommended" data
+  //GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
+  // For parsing data, we don't suggest using anything but either RMC only or RMC+GGA since
+  // the parser doesn't care about other sentences at this time
+
+  // Set the update rate
+  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);   // 1 Hz update rate
+  // For the parsing code to work nicely and have time to sort thru the data, and
+  // print it out we don't suggest using anything higher than 1 Hz
+
+  // Request updates on antenna status, comment out to keep quiet
+  GPS.sendCommand(PGCMD_ANTENNA);
+
+  // the nice thing about this code is you can have a timer0 interrupt go off
+  // every 1 millisecond, and read data from the GPS for you. that makes the
+  // loop code a heck of a lot easier!
+  useInterrupt(true);
+
+  // Ask for firmware version
+  mySerial.println(PMTK_Q_RELEASE);
+
+
+
+  // Open serial communications and wait for port to open:
+  while (!Serial) {
+    ; // wait for serial port to connect. Needed for Leonardo only
+  }
+
+  dataFile.println("S1 GPS Solar Tracker VT4.00.M Logger");
+  Serial.print("Initializing SD card...");
+  // make sure that the default chip select pin is set to
+  // output, even if you don't use it:
+  pinMode(SS, OUTPUT);
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+  }
+  else{
+  Serial.println("card initialized.");
+  }
+  
+  // Open up the file we're going to log to!
+  dataFile = SD.open("datalog.txt", FILE_WRITE);
+  if (! dataFile) {
+    Serial.println("error opening datalog.txt");
+    // Wait forever since we cant write data
+  }
+}
+
+
+// Interrupt is called once a millisecond, looks for any new GPS data, and stores it
+SIGNAL(TIMER0_COMPA_vect) {
+  char c = GPS.read();
+  // if you want to debug, this is a good time to do it!
+#ifdef UDR0
+  if (GPSECHO)
+    if (c) UDR0 = c;
+  // writing direct to UDR0 is much much faster than Serial.print
+  // but only one character can be written at a time.
+#endif
+}
+
+void useInterrupt(boolean v) {
+  if (v) {
+    // Timer0 is already used for millis() - we'll just interrupt somewhere
+    // in the middle and call the "Compare A" function above
+    OCR0A = 0xAF;
+    TIMSK0 |= _BV(OCIE0A);
+    usingInterrupt = true;
+  } else {
+    // do not call the interrupt function COMPA anymore
+    TIMSK0 &= ~_BV(OCIE0A);
+    usingInterrupt = false;
+  }
+}
+
+int initial = 0;                //Set initial in order to show GPS data upon switch on
+
+uint32_t timer = millis();
+
+void loop()                     // run over and over again
+{
+  // in case you are not using the interrupt above, you'll
+  // need to 'hand query' the GPS, not suggested :(
+  if (! usingInterrupt) {
+    // read data from the GPS in the 'main loop'
+    char c = GPS.read();
+    // if you want to debug, this is a good time to do it!
+    if (GPSECHO)
+      if (c) Serial.print(c);
+  }
+
+  // if a sentence is received, we can check the checksum, parse it...
+  if (GPS.newNMEAreceived()) {
+    // a tricky thing here is if we print the NMEA sentence, or data
+    // we end up not listening and catching other sentences!
+    // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
+    //Serial.println(GPS.lastNMEA());   // this also sets the newNMEAreceived() flag to false
+
+    if (!GPS.parse(GPS.lastNMEA()))   // this also sets the newNMEAreceived() flag to false
+      return;  // we can fail to parse a sentence in which case we should just wait for another
+  }
+
+  Windread();
+
+  //Wait for 5s before printing the initial data
+
+  if (initial < 30000) {
+    initial++;
+  }
+  if (initial == 30000) {
+    GPS_get();
+    Reset();
+    Main_operation();
+    initial ++;
+  }
+
+  // if millis() or timer wraps around, we'll just reset it
+  if (timer > millis())  timer = millis();
+
+  // approximately every 1 minute or so, print out the current stats
+  if (millis() - timer > 450000) {
+    timer = millis(); // reset the timer
+    if (Stow == false) {
+      Main_operation();
+    }
+    else {
+      Instow();
+    }
+  }
+
+  if (Stowbutton == HIGH) {
+    firsttime = millis();
+    while (Stowbutton == HIGH) {
+      held = millis() - firsttime;
+      if (Stowbutton == LOW) {
+        break;
+      }
+    }
+    if (held > 2000) {
+      Stow = true;
+      Serial.println("\nOperation Stow");
+      Stowtimer = 0;
+      delay(1000);
+      OpStowmode();
+      return;
+    }
+    else {
+      Stow = true;
+      Serial.println("\nSwitching to Stow mode");
+      Stowtimer = 0;
+      delay(1000);
+      Stowmode();
+      return;
+    }
+  }
+}
+
+
+
+
+//Functions
+//------------------------------------------------------------------------------------------------
+
+void Main_operation() {
+
+Dashline();
+
+  // Find the appropreate time zone
+  timezone = GPS.longitudeDegrees / 15;
+  //Serial.print("\nTimezone: ");
+  //Serial.println(timezone);
+
+  if (internaltime > millis())  internaltime = millis();
+  timediff = (millis() - internaltime) / 1000;
+
+  // Check the Current local time base on Timezone
+  if (GPS.fix) {
+    Localhour = GPS.hour + timezone;
+    Localday = GPS.day;
+    Localmonth = GPS.month;
+    Localyear = GPS.year;
+    if (Localhour < 0) {
+      Localhour = Localhour + 24;
+      Localday = GPS.day - 1;
+    }
+    Localminute = GPS.minute;
+    Localsecond = GPS.seconds;
+    Serial.println("Using GPS");
+  }
+  else {
+    Localsecond = Localsecond + timediff;
+    while (Localsecond > 60) {
+      Localminute++;
+      Localsecond = Localsecond - 60;
+    }
+    while (Localminute > 60) {
+      Localhour++;
+      Localminute = Localminute - 60;
+    }
+    if (Localhour > 24) {
+      Localday++;
+      Localhour = Localhour - 24;
+    }
+    Serial.println("Using Internal clock");
+  }
+  internaltime = millis();
+
+  Serial.print("\nLocal time: ");
+  Serial.print(Localhour, DEC); Serial.print(':');
+  Serial.print(Localminute, DEC); Serial.print(':');
+  Serial.println(Localsecond, DEC); //For seconds only
+  Serial.print("Local Date: ");
+  Serial.print(Localday, DEC); Serial.print('/');
+  Serial.print(GPS.month, DEC); Serial.print("/20");
+  Serial.println(GPS.year, DEC);
+
+
+  //if (GPS.fix) {
+  //Serial.print("Location (in degrees): ");
+  //Serial.print(GPS.latitudeDegrees, 4);
+  //Serial.print(", ");
+  //Serial.println(GPS.longitudeDegrees, 4);
+  //}
+
+  Suncalc();
+  if (GPSdebug) {
+    Suncalcdebug();
+  }
+
+  //Checking current time before tracking the sun
+  if (timeint > sunrisetime && timeint < sunsettime) {
+    Serial.print("Solar Elevation Angle (deg): ");
+    Serial.println(solarelevation, 2);                  //Real Elevation
+    Serial.print("Solar Azimuth Angle (deg cw from N): ");
+    Serial.println(solarazimuth, 2);                     //Real Azimuth
+    Resettimer = 0;
+    Morningsetup();
+    Tracking();
+  }
+  else {
+    Serial.println("Not active sun hour");
+    Serial.print("Expected sun rise time: ");
+    Serial.print(sunrisetime * 24, 0);
+    Serial.print(":");
+    int sunriseh = sunrisetime * 24;
+    Serial.println((sunrisetime * 24 - sunriseh) * 60, 0);
+    Reset();
+    Morningtimer = 0;
+  }
+}
+
+//------------------------------------------------------------------------------------------------
+
+void Morningsetup() {
+  if (Morningtimer == 0) {
+    Serial.println ("\nSetting East Morning");
+    digitalWrite (SouthPin, LOW);
+    delay (60000 * 2.7);
+    digitalWrite (SouthPin, HIGH);
+    lastelevation = southlimit;
+    Morningtimer++;
+  }
+}
+
+//------------------------------------------------------------------------------------------------
+
+void Instow() {
+  Serial.print("\nStow time: ");
+  Serial.print(Localhour, DEC); Serial.print(':');
+  Serial.print(Localminute, DEC); Serial.print(':');
+  Serial.println(Localsecond, DEC); //For seconds only
+  Serial.print("Stow Date: ");
+  Serial.print(Localday, DEC); Serial.print('/');
+  Serial.print(GPS.month, DEC); Serial.print("/20");
+  Serial.println(GPS.year, DEC);
+  Serial.println("Currently Stow");
+
+  Stowbutton = digitalRead(StowbuttonPin);
+  if (Stowbutton == HIGH) {
+    Stow = false;
+    Serial.println("\nSwitching to GPS Control");
+    digitalWrite (NorthPin, HIGH);
+    Stowtimer = 0;
+    delay(1000);
+    Main_operation();
+  }
+
+}
+
+//------------------------------------------------------------------------------------------------
+
+void Dashline()
+{
+  Serial.println("\n--------------------------------");
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void GPS_get() {
+  Serial.println("\nChecking GPS Data");
+  timezone = GPS.longitudeDegrees / 15;
+  Serial.print("\nTimezone: ");
+  Serial.println(timezone);
+
+  // Check the Current local time base on Timezone
+  Localhour = GPS.hour + timezone;
+  Localday = GPS.day;
+  if (Localhour < 0) {
+    Localhour = Localhour + 24;
+    Localday = GPS.day - 1;
+  }
+
+
+  //Serial.print("Time: ");
+  //Serial.print(GPS.hour, DEC); Serial.print(':'); //No Timezone adjusted
+  //Serial.print(GPS.minute, DEC); Serial.print(':');
+  //Serial.println(GPS.seconds, DEC); //For seconds only
+  //Serial.print(GPS.seconds, DEC); Serial.print('.');
+  //Serial.println(GPS.milliseconds); //For milliseconds
+  //Serial.print("Date: ");
+  //Serial.print(GPS.day, DEC); Serial.print('/');
+  //Serial.print(GPS.month, DEC); Serial.print("/20");
+  //Serial.println(GPS.year, DEC);
+
+  Serial.print("Local time: ");
+  Serial.print(Localhour, DEC); Serial.print(':');
+  Serial.print(GPS.minute, DEC); Serial.print(':');
+  Serial.print(GPS.seconds, DEC); Serial.print('.');
+  Serial.println(GPS.milliseconds); //For milliseconds
+  Serial.print("Local Date: ");
+  Serial.print(Localday, DEC); Serial.print('/');
+  Serial.print(GPS.month, DEC); Serial.print("/20");
+  Serial.println(GPS.year, DEC);
+
+  Serial.print("Fix: "); Serial.print((int)GPS.fix);
+  Serial.print(" quality: "); Serial.println((int)GPS.fixquality);
+  if (GPS.fix) {
+    Serial.print("Location: ");
+    Serial.print(GPS.latitude, 4); Serial.print(GPS.lat);
+    Serial.print(", ");
+    Serial.print(GPS.longitude, 4); Serial.println(GPS.lon);
+    Serial.print("Location (in degrees): ");
+    Serial.print(GPS.latitudeDegrees, 4);
+    Serial.print(", ");
+    Serial.println(GPS.longitudeDegrees, 4);
+
+    //Serial.print("Speed (knots): "); Serial.println(GPS.speed);
+    //Serial.print("Angle: "); Serial.println(GPS.angle);
+    Serial.print("Altitude: "); Serial.println(GPS.altitude);
+    Serial.print("Satellites: "); Serial.println((int)GPS.satellites);
+  }
+}
+
+
+
+//------------------------------------------------------------------------------------------------
+
+// Now we can turn GPS data into Sun location by using equations provided by NOAA
+// https://www.esrl.noaa.gov/gmd/grad/solcalc/
+// Julian Day equations provided by USNO
+// http://aa.usno.navy.mil/faq/docs/JD_Formula.php
+
+void Suncalc() {
+
+  if (GPS.fix) {
+    setlatitude = GPS.latitudeDegrees;     //Converting time into Day
+    setlongitude = GPS.longitudeDegrees;
+    secint = 60 * GPS.minute + GPS.seconds;
+    hourint = Localhour + secint / 3600;
+    timeint = hourint / 24;
+  }
+
+  //We skiped Julian Day and went straight to Julian Century
+  juliancentury = 0.01 * GPS.year + 0.00083257 * GPS.month + 0.0000273785 * Localday + 0.00000114 * Localhour + 0.00000114 * timezone - 0.0009;
+
+  geomeanlongdou = 280.46646 + juliancentury * (36000.76983 + juliancentury * 0.0003032);
+  geomeanlongint = 280.46646 + juliancentury * (36000.76983 + juliancentury * 0.0003032);
+  geomeanlong = geomeanlongint % 360 + geomeanlongdou - geomeanlongint;
+
+  geomeananom = 357.52911 + juliancentury * (35999.05029 - 0.0001537 * juliancentury);
+
+  earthorbit = 0.016708634 - juliancentury * (0.000042037 + 0.0000001267 * juliancentury);
+
+  suneq = sin(geomeananom / rad) * (1.914602 - juliancentury * (0.004817 + 0.000014 * juliancentury)) + sin((2 * geomeananom) / rad) * (0.019993 - 0.000101 * juliancentury) + sin((3 * geomeananom) / rad) * 0.000289;
+
+  suntruelong = geomeanlong + suneq;
+
+  suntrueanom = geomeananom + suneq;
+
+  sunradvector = (1.000001018 * (1 - earthorbit * earthorbit)) / (1 + earthorbit * cos((suntrueanom) / rad));
+
+  sunapplong = suntruelong - 0.00569 - 0.00478 * sin((125.04 - 1934.136 * juliancentury) / rad);
+
+  meanobliq = 23 + (26 + ((21.448 - juliancentury * (46.815 + juliancentury * (0.00059 - juliancentury * 0.001813)))) / 60) / 60;
+
+  obliqcorr = meanobliq + 0.00256 * cos((125.04 - 1934.136 * juliancentury) / rad);
+
+  asceny = cos((sunapplong) / rad);
+  ascenx = cos((obliqcorr) / rad) * sin((sunapplong) / rad);
+  ascentan = atan2 (ascenx, asceny); // arc tangent of x/y
+  sunrtascen = rad * ascentan;
+
+  sundeclin = rad * (asin(sin((obliqcorr) / rad) * sin((sunapplong) / rad)));
+
+  vary = tan((obliqcorr / 2) / rad) * tan((obliqcorr / 2) / rad);
+
+  eqtime = 4 * rad * (vary * sin(2 * (geomeanlong) / rad) - 2 * earthorbit * sin((geomeananom) / rad) + 4 * earthorbit * vary * sin((geomeananom) / rad) * cos(2 * (geomeanlong) / rad) - 0.5 * vary * vary * sin(4 * (geomeanlong) / rad) - 1.25 * earthorbit * earthorbit * sin(2 * (geomeananom) / rad));
+
+  hasunrise = rad * (acos(cos((90.833) / rad) / (cos((setlatitude) / rad) * cos((sundeclin) / rad)) - tan((setlatitude) / rad) * tan((sundeclin) / rad)));
+
+  solarnoon = (720 - 4 * setlongitude - eqtime + timezone * 60) / 1440;
+
+  sunrisetime = solarnoon - hasunrise * 4 / 1440;
+
+  sunsettime = solarnoon + hasunrise * 4 / 1440;
+
+  sunduration = 8 * hasunrise;
+
+  truesolardou = timeint * 1440 + eqtime + 4 * setlongitude - 60 * timezone;
+  truesolarint = timeint * 1440 + eqtime + 4 * setlongitude - 60 * timezone;
+  truesolar = truesolarint % 1440 + truesolardou - truesolarint;
+
+  hourangle = 0;
+  if (truesolar < 0) {
+    hourangle = truesolar / 4 + 180;
+  }
+  else {
+    hourangle = truesolar / 4 - 180;
+  }
+
+  solarzenith = rad * (acos(sin((setlatitude) / rad) * sin((sundeclin) / rad) + cos((setlatitude) / rad) * cos((sundeclin) / rad) * cos((hourangle) / rad)));
+
+  solarelevation = 90 - solarzenith;
+  //Serial.print("Solar Elevation Angle (deg): ");
+  //Serial.println(solarelevation, 2);                  //Real Elevation
+
+  if (hourangle > 0) {
+    pangledou = rad * (acos(((sin((setlatitude) / rad) * cos((solarzenith) / rad)) - sin( (sundeclin) / rad)) / (cos( (setlatitude) / rad) * sin( (solarzenith) / rad)))) + 180;
+    pangleint = pangledou;
+  }
+  else {
+    pangledou = 540 - rad * (acos(((sin((setlatitude) / rad) * cos((solarzenith) / rad)) - sin( (sundeclin) / rad)) / (cos( (setlatitude) / rad) * sin( (solarzenith) / rad))));
+    pangleint = pangledou;
+  }
+  solarazimuth = pangleint % 360 + pangledou - pangleint;
+  //Serial.print("Solar Azimuth Angle (deg cw from N): ");
+  //Serial.println(solarazimuth, 2);                     //Real Azimuth
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void Suncalcdebug() {
+
+  Serial.println("\nSun GPS calculation. To stop showing, turn debug off");
+
+  Serial.print("Julian Century: ");
+  Serial.println(juliancentury, 8);
+
+  Serial.print("Geom Mean Long Sun (deg): ");
+  Serial.println(geomeanlong, 8);
+
+  Serial.print("Geom Mean Anom Sun (deg): ");
+  Serial.println(geomeananom, 8);
+
+  Serial.print("Eccent Earth Orbit: ");
+  Serial.println(earthorbit, 8);
+
+  Serial.print("Sun Eq of Ctr: ");
+  Serial.println(suneq, 8);
+
+  Serial.print("Sun True Long (deg): ");
+  Serial.println(suntruelong, 8);
+
+  Serial.print("Sun True Anom (deg): ");
+  Serial.println(suntrueanom, 8);
+
+  Serial.print("Sun Rad Vector (AUs): ");
+  Serial.println(sunradvector, 8);
+
+  Serial.print("Sun App Long (deg): ");
+  Serial.println(sunapplong, 8);
+
+  Serial.print("Mean Obliq Ecliptic (deg): ");
+  Serial.println(meanobliq, 8);
+
+  Serial.print("Obliq Corr (deg): ");
+  Serial.println(obliqcorr, 8);
+
+  Serial.print("Sun Rt Ascen (deg): ");
+  Serial.println(sunrtascen, 8);
+
+  Serial.print("Sun Declin (deg): ");
+  Serial.println(sundeclin, 8);
+
+  Serial.print("Var y: ");
+  Serial.println(vary, 8);
+
+  Serial.print("Eq of Time (minutes): ");
+  Serial.println(eqtime, 8);
+
+  Serial.print("HA sunrise (deg): ");
+  Serial.println(hasunrise, 8);
+
+  Serial.print("Solar Noon (LST): ");
+  Serial.println(solarnoon, 8);
+
+  Serial.print("Sun Rise Time: ");
+  Serial.println(sunrisetime, 8);
+
+  Serial.print("Sun Set Time: ");
+  Serial.println(sunsettime, 8);
+
+  Serial.print("Sun duration (minutes): ");
+  Serial.println(sunduration, 8);
+
+  Serial.print("True Solar Time (minutes): ");
+  Serial.println(truesolar, 8);
+
+  Serial.print("Hour Angle (deg): ");
+  Serial.println(hourangle, 8);
+
+  Serial.print("Solar Zenith Angle (deg): ");
+  Serial.println(solarzenith, 8);
+
+  Serial.print("Solar Elevation Angle (deg): ");
+  Serial.println(solarelevation, 8);                   //Initial Elevation
+
+  Serial.print("Solar Azimuth Angle (deg cw from N): ");
+  Serial.println(solarazimuth, 8);                     //Real Azimuth
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void Stowmode() {
+  if (Stowtimer == 0) {
+    Serial.println ("\nFlatten the panel");
+    digitalWrite (NorthPin, LOW);
+    delay (60000 * 2.7);
+    digitalWrite (NorthPin, HIGH);
+    Serial.println ("\nSet to stow");
+    lastelevation = northlimit;
+    Stowtimer++;
+  }
+  return;
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void OpStowmode() {
+  if (Stowtimer == 0) {
+    Serial.println ("\nFlatten the panel and South");
+
+    EWmotor = 180 - lastazimuth;
+    lastazimuth = 180;
+    Serial.println(EWmotor);
+    if (EWmotor > 0) {
+      digitalWrite(WestPin, LOW);
+
+      delay(EWmotor * trackmodify);
+
+      digitalWrite(WestPin, HIGH);
+    }
+    else {
+      digitalWrite(EastPin, LOW);
+
+      delay(-EWmotor * trackmodify);
+
+      digitalWrite(EastPin, HIGH);
+    }
+    delay(1000);
+    digitalWrite (NorthPin, LOW);
+    delay (60000 * 2.7);
+    digitalWrite (NorthPin, HIGH);
+    lastelevation = northlimit;
+    Stowtimer++;
+  }
+  return;
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void Reset() {
+  if (Resettimer == 0) {
+    Serial.println ("\nInitiallizing Panal position...");
+    Serial.println ("Please stay clear");
+    delay (60000);
+
+    digitalWrite (NorthPin, LOW);
+    delay (60000 * 2.7);
+
+    digitalWrite (NorthPin, HIGH);
+
+    delay(1000);
+
+    digitalWrite (EastPin, LOW);
+    delay (60000 * 7);
+
+    digitalWrite (EastPin, HIGH);
+
+    lastelevation = northlimit;
+    lastazimuth = eastlimit;
+
+    Serial.println ("Panel set to East and Stow");
+    Resettimer++;
+    delay(2000);
+  }
+}
+
+
+//------------------------------------------------------------------------------------------------
+
+
+void Windread() {
+  if (Windtimer < 1) {
+    Windtimer++;
+    delay(1000);
+  }
+  else {
+    anemometerread = analogRead(AnemometerPin);
+    windspeed = (anemometerread / 205 - 0.4) / 1.6 * 32.4 * 2.237;
+    //windspeed = (anemometerread - 81) * 0.4336;
+    Windtimer = 0;
+    if (windspeednum < 10) {
+      windspeedsum = windspeedsum + windspeed;
+      windspeednum++;
+    }
+    else {
+      windspeedavg = abs(windspeedsum / windspeednum);
+      windspeednum = 0;
+      windspeedsum = 0;
+      Serial.print("Wind speed: ");
+      Serial.print(windspeedavg, 1);
+      Serial.println(" Mph");
+
+      if (loggertimer < 6) {
+        loggertimer++;
+      }
+      else {
+        Logging();
+        loggertimer = 0;
+      }
+    }
+  }
+  if (windspeedavg > speedlimit) {
+    if (windalarmtimer == 0) {
+      Serial.println ("Wind speed exceeds set limit");
+      windalarmtimer ++;
+    }
+    Stow = true;
+    Stowmode();
+    Windalarm = true;
+    windalarmcountdown = 30 * 60;
+    return;
+  }
+  if (windspeedavg < speedlimit) {
+    if (Windalarm == true) {
+      if (windalarmcountdown > 0) {
+        windalarmcountdown--;
+      }
+      else {
+        Serial.println("\nWind speed alarm lifted");
+        digitalWrite(NorthPin, HIGH);
+        Stow = false;
+        Windalarm = false;
+        Stowtimer = 0;
+        Main_operation();
+        windalarmtimer = 0;
+      }
+    }
+  }
+}
+
+//------------------------------------------------------------------------------------------------
+
+void Tracking() {
+  Serial.println("\nTracking in progress");
+  delay(1000);
+
+  if (solarelevation < northlimit && solarelevation > southlimit) {
+
+    NSmotor = solarelevation - lastelevation;
+    lastelevation = solarelevation;
+    Serial.println(NSmotor);
+    if (NSmotor > 0) {
+      digitalWrite(NorthPin, LOW);
+
+      delay(NSmotor * trackmodify);
+
+      digitalWrite(NorthPin, HIGH);
+    }
+    else {
+      digitalWrite(SouthPin, LOW);
+
+      delay(-NSmotor * trackmodify);
+
+      digitalWrite(SouthPin, HIGH);
+    }
+  }
+  else {
+    Serial.println("\nNS Out of Tracking Range");
+  }
+
+  delay(1000);
+
+  if (solarazimuth < westlimit && solarazimuth > eastlimit) {
+
+    EWmotor = solarazimuth - lastazimuth;
+    lastazimuth = solarazimuth;
+    Serial.println(EWmotor);
+    if (EWmotor > 0) {
+      digitalWrite(WestPin, LOW);
+
+      delay(EWmotor * trackmodify);
+
+      digitalWrite(WestPin, HIGH);
+
+    }
+    else {
+      digitalWrite(EastPin, LOW);
+
+      delay(-EWmotor * trackmodify);
+
+      digitalWrite(EastPin, HIGH);
+
+    }
+  }
+  else {
+    Serial.println("\nEW Out of Tracking Range");
+  }
+}
+
+
+
+//------------------------------------------------------------------------------------------------
+
+void Logging()
+{
+
+  dataFile.print("\nLocal time: ");
+  dataFile.print(Localhour, DEC); Serial.print(':');
+  dataFile.print(Localminute, DEC); Serial.print(':');
+  dataFile.println(Localsecond, DEC); //For seconds only
+  dataFile.print("Local Date: ");
+  dataFile.print(Localday, DEC); Serial.print('/');
+  dataFile.print(GPS.month, DEC); Serial.print("/20");
+  dataFile.println(GPS.year, DEC);
+
+  dataFile.print("Last Elevation: ");
+  dataFile.println(lastelevation);
+  dataFile.print("Last Azimuth: ");
+  dataFile.println(lastazimuth);
+
+  dataFile.print("Wind speed: ");
+  dataFile.print(windspeedavg, 1);
+  dataFile.println(" Mph");
+
+  if (Stow == true) {
+    dataFile.print("Currently Stow");
+  }
+
+  // The following line will 'save' the file to the SD card after every
+  // line of data - this will use more power and slow down how much data
+  // you can read but it's safer!
+  // If you want to speed up the system, remove the call to flush() and it
+  // will save the file only every 512 bytes - every time a sector on the
+  // SD card is filled with data.
+  dataFile.flush();
+
+  // Take 1 measurement every 100 milliseconds
+  delay(100);
+}
+
+
+//------------------------------------------------------------------------------------------------
